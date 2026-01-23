@@ -24,6 +24,8 @@ The VCU Management Service provides:
 - **Call Home API**: Device-initiated check-in endpoint for receiving update instructions
 - **MQTT Integration**: Real-time update notifications to devices
 - **Reporting**: Analytics on version distribution and update progress
+- **OTA Constraints**: Automatic update skipping based on battery level (< 40%) and signal strength
+- **Structured Metadata**: Validated device state information (location, time, battery, network)
 
 ## Architecture
 
@@ -185,6 +187,10 @@ sequenceDiagram
 - The API response is immediate; device state updates happen asynchronously
 - If a device already has the target version, pending tasks are auto-marked as UPDATED
 - New devices are automatically registered during call-home
+- **OTA Constraints**: Updates are automatically skipped if:
+  - Battery percentage is below 40%
+  - Signal strength is poor (RSSI < 10, parsed from signalStrength field)
+- **Metadata Structure**: Call-home metadata must follow the structured format with validated fields (location, time, date, batteryPercentage, isp, signalStrength)
 
 ### 3. Update Task Flow
 
@@ -329,11 +335,16 @@ All device API endpoints are protected by the `@VerifySignature` annotation, whi
 
 | Method | Endpoint | Description | Authentication |
 |--------|----------|-------------|----------------|
-| POST | `/v1/device-api/call-home` | Device check-in for updates | `@VerifySignature` (RSA/HMAC) |
-| POST | `/v1/device-api/ack` | Acknowledge update receipt | `@VerifySignature` (RSA/HMAC) |
-| POST | `/v1/device-api/update-complete` | Report update completion | `@VerifySignature` (RSA/HMAC) |
+| POST | `/v1/device-api/call-home` | Device check-in for updates | `@VerifySignature` (HMAC preferred) |
+| POST | `/v1/device-api/ack` | Acknowledge update receipt with device state | `@VerifySignature` (HMAC preferred) |
+| POST | `/v1/device-api/update-complete` | Report update completion | `@VerifySignature` (HMAC preferred) |
 
-**Note**: The `@VerifySignature` annotation is applied to each endpoint method in `DeviceApiController`, causing the `SignatureVerificationFilter` to intercept requests and verify the `X-RECHAJ-SIGNATURE` header before allowing the request to proceed.
+**Note**: 
+- The `@VerifySignature` annotation is applied to each endpoint method in `DeviceApiController`, causing the `SignatureVerificationFilter` to intercept requests and verify the `X-RECHAJ-SIGNATURE` header before allowing the request to proceed.
+- **HMAC is the preferred authentication method** for VCU devices (lower computational overhead).
+- Task IDs are returned as 32-character strings (UUID without hyphens) to minimize payload size.
+- Call-home requires structured metadata format (see examples below).
+- Acknowledgment includes device state fields (initiatingOta, batteryPercentage, isp, rssi).
 
 ### Admin API (Requires JWT Authentication)
 
@@ -346,31 +357,208 @@ All device API endpoints are protected by the `@VerifySignature` annotation, whi
 
 ## Security - @VerifySignature
 
-The `@VerifySignature` annotation provides request authentication for device-to-service communication using either HMAC-SHA256 or RSA signature verification.
+The `@VerifySignature` annotation provides request authentication for device-to-service communication using either **HMAC-SHA256 (preferred)** or RSA signature verification.
 
-**Implementation**: All methods in `DeviceApiController` are annotated with `@VerifySignature`. The `SignatureVerificationFilter` intercepts requests to these endpoints, extracts the `X-RECHAJ-SIGNATURE` header, and verifies it using the configured method (HMAC or RSA) before allowing the request to reach the controller.
+**HMAC is the preferred method** for VCU devices due to:
+- Lower computational overhead on MCU
+- Smaller memory footprint  
+- Faster request signing and verification
+
+**Implementation**: All methods in `DeviceApiController` are annotated with `@VerifySignature`. The `SignatureVerificationFilter` intercepts requests to these endpoints, extracts the `X-RECHAJ-SIGNATURE` header, and verifies it using the configured method (HMAC by default, or RSA) before allowing the request to reach the controller.
 
 ## Hardware Integration Guide
 
-This section provides step-by-step instructions for hardware engineers implementing device-to-service communication using RSA signature verification.
+This section provides step-by-step instructions for hardware engineers implementing device-to-service communication using HMAC (preferred) or RSA signature verification.
 
 ### Overview
 
-All device API endpoints (`/v1/device-api/call-home`, `/v1/device-api/ack`, `/v1/device-api/update-complete`) are protected by the `@VerifySignature` annotation, which requires request signature verification using RSA (or HMAC if configured). You must:
+All device API endpoints (`/v1/device-api/call-home`, `/v1/device-api/ack`, `/v1/device-api/update-complete`) are protected by the `@VerifySignature` annotation, which requires request signature verification using **HMAC-SHA256 (preferred)** or RSA. You must:
 1. Create a JSON payload (request body)
-2. Sign the payload using your **RSA private key** (SHA256withRSA algorithm)
+2. Sign the payload using either:
+   - **HMAC**: Shared secret key (HmacSHA256 algorithm) - **Preferred method**
+   - **RSA**: Private key (SHA256withRSA algorithm) - For backward compatibility
 3. Send the request with the signature in the `X-RECHAJ-SIGNATURE` header
 
 **Important**: 
-- Your device uses the **PRIVATE KEY** to sign requests
-- The server uses the corresponding **PUBLIC KEY** to verify your signatures
-- Never share your private key - keep it secure on your device
+- **HMAC (Preferred)**: Your device uses a **SHARED SECRET KEY** to sign requests. The server uses the same key to verify.
+- **RSA (Alternative)**: Your device uses a **PRIVATE KEY** to sign requests. The server uses the corresponding **PUBLIC KEY** to verify.
+- Never share your private key or secret key - keep it secure on your device
 
-### Quick Start: RSA Signing
+### Quick Start: HMAC Signing (Preferred)
 
-RSA provides asymmetric cryptography - your device signs with a private key, and the server verifies with the public key.
+HMAC provides symmetric cryptography using a shared secret key. This is the preferred method for VCU devices.
 
-#### Step 1: Get Your RSA Private Key
+#### Step 1: Get Your Shared Secret Key
+
+Contact your system administrator to obtain the shared secret key. This key is the same for all devices and must be kept secure.
+
+**Security Note**: Store this secret key securely on your device (encrypted storage, secure element, or TPM if available).
+
+#### Step 2: Create the JSON Payload
+
+Create a compact JSON string (no extra spaces, no trailing newlines). The exact string you sign must match exactly what you send in the request body.
+
+**Example for Call Home:**
+```json
+{"serialNumber":"VCU-001","firmwareVersion":"1.2.0","metadata":{"location":"6.5244,3.3792","time":"14:30:45","date":"2024:03:15","batteryPercentage":80,"isp":"MTN","signalStrength":"25_LTE"}}
+```
+
+**Example for Acknowledge:**
+```json
+{"serialNumber":"VCU-001","taskId":"550e8400e29b41d4a716446655440000","initiatingOta":true,"batteryPercentage":80,"isp":"MTN","rssi":25}
+```
+
+**Example for Update Complete:**
+```json
+{"serialNumber":"VCU-001","taskId":"550e8400e29b41d4a716446655440000","newVersion":"2.0.0","success":true}
+```
+
+**Note**: Task IDs are 32 characters (UUID without hyphens) to minimize payload size.
+
+#### Step 3: Generate HMAC Signature
+
+**C/C++ Example (using OpenSSL):**
+
+```c
+#include <openssl/hmac.h>
+#include <openssl/sha.h>
+#include <base64.h>  // You'll need a base64 library
+
+/**
+ * Generate HMAC signature for a payload using HmacSHA256
+ * 
+ * @param payload: The JSON string to sign
+ * @param secret_key: Shared secret key (null-terminated string)
+ * @param signature_out: Output buffer for base64-encoded signature (must be at least 512 bytes)
+ * @return: 0 on success, -1 on error
+ */
+int generate_hmac_signature(const char* payload, const char* secret_key, char* signature_out) {
+    unsigned char hmac_result[SHA256_DIGEST_LENGTH];
+    unsigned int hmac_len;
+    
+    HMAC(EVP_sha256(), 
+         secret_key, strlen(secret_key),
+         (unsigned char*)payload, strlen(payload),
+         hmac_result, &hmac_len);
+    
+    base64_encode(hmac_result, SHA256_DIGEST_LENGTH, signature_out);
+    return 0;
+}
+```
+
+**Python Example:**
+
+```python
+import hmac
+import hashlib
+import base64
+import json
+
+def generate_hmac_signature(payload: str, secret_key: str) -> str:
+    """Generate HMAC signature using HmacSHA256"""
+    signature_bytes = hmac.new(
+        secret_key.encode('utf-8'),
+        payload.encode('utf-8'),
+        hashlib.sha256
+    ).digest()
+    return base64.b64encode(signature_bytes).decode('utf-8')
+
+# Example: Call Home
+secret_key = "your-shared-secret-key"
+payload = json.dumps({
+    "serialNumber": "VCU-001",
+    "firmwareVersion": "1.2.0",
+    "metadata": {
+        "location": "6.5244,3.3792",
+        "time": "14:30:45",
+        "date": "2024:03:15",
+        "batteryPercentage": 80,
+        "isp": "MTN",
+        "signalStrength": "25_LTE"
+    }
+}, separators=(',', ':'))  # Compact JSON
+
+signature = generate_hmac_signature(payload, secret_key)
+print(f"Signature: {signature}")
+```
+
+**cURL Example:**
+
+```bash
+SECRET_KEY="your-shared-secret-key"
+PAYLOAD='{"serialNumber":"VCU-001","firmwareVersion":"1.2.0","metadata":{"location":"6.5244,3.3792","time":"14:30:45","date":"2024:03:15","batteryPercentage":80,"isp":"MTN","signalStrength":"25_LTE"}}'
+
+# Generate HMAC signature
+SIGNATURE=$(echo -n "$PAYLOAD" | openssl dgst -sha256 -hmac "$SECRET_KEY" -binary | base64 -w 0)
+
+# Send request
+curl -X POST "https://api.example.com/v1/device-api/call-home" \
+  -H "Content-Type: application/json" \
+  -H "X-RECHAJ-SIGNATURE: $SIGNATURE" \
+  -d "$PAYLOAD"
+```
+
+#### Step 4: Send the Request
+
+Send an HTTP POST request with:
+- **Content-Type**: `application/json`
+- **X-RECHAJ-SIGNATURE**: The base64-encoded HMAC signature
+- **Body**: The exact JSON payload you signed
+
+**Example HTTP Request:**
+```
+POST /v1/device-api/call-home HTTP/1.1
+Host: api.example.com
+Content-Type: application/json
+X-RECHAJ-SIGNATURE: 3xK8mP2vQ9wR5tY7uI1oA6sD4fG8hJ2kL9mN0pQ3rS6tU=
+Content-Length: 185
+
+{"serialNumber":"VCU-001","firmwareVersion":"1.2.0","metadata":{"location":"6.5244,3.3792","time":"14:30:45","date":"2024:03:15","batteryPercentage":80,"isp":"MTN","signalStrength":"25_LTE"}}
+```
+
+**Java Example:**
+```java
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
+import java.nio.charset.StandardCharsets;
+import java.util.Base64;
+
+public class HmacSignatureGenerator {
+    private static final String HMAC_ALGORITHM = "HmacSHA256";
+
+    public static String generateSignature(String payload, String secretKey)
+            throws Exception {
+        Mac mac = Mac.getInstance(HMAC_ALGORITHM);
+        SecretKeySpec keySpec = new SecretKeySpec(
+            secretKey.getBytes(StandardCharsets.UTF_8),
+            HMAC_ALGORITHM
+        );
+        mac.init(keySpec);
+
+        byte[] signatureBytes = mac.doFinal(
+            payload.getBytes(StandardCharsets.UTF_8)
+        );
+        return Base64.getEncoder().encodeToString(signatureBytes);
+    }
+}
+
+// Usage
+String jsonPayload = "{\"serialNumber\":\"VCU-001\",\"firmwareVersion\":\"1.0.0\",\"metadata\":{\"location\":\"6.5244,3.3792\",\"time\":\"14:30:45\",\"date\":\"2024:03:15\",\"batteryPercentage\":80,\"isp\":\"MTN\",\"signalStrength\":\"25_LTE\"}}";
+String signature = HmacSignatureGenerator.generateSignature(jsonPayload, secretKey);
+
+HttpRequest request = HttpRequest.newBuilder()
+    .uri(URI.create("https://api.example.com/v1/device-api/call-home"))
+    .header("Content-Type", "application/json")
+    .header("X-RECHAJ-SIGNATURE", signature)
+    .POST(HttpRequest.BodyPublishers.ofString(jsonPayload))
+    .build();
+```
+
+### Alternative: RSA Signing
+
+RSA provides asymmetric cryptography - your device signs with a private key, and the server verifies with the public key. Use this method if HMAC is not configured.
+
+#### Step 1: Get Your RSA Private Key (RSA Method Only)
 
 Contact your system administrator to obtain your device's RSA private key. This key is unique to your device and must be kept secure. The corresponding public key is already configured on the server.
 
@@ -389,17 +577,17 @@ Create a compact JSON string (no extra spaces, no trailing newlines). The exact 
 
 **Example for Call Home:**
 ```json
-{"serialNumber":"VCU-001","deviceVersion":"1.2.0","metadata":{"location":"warehouse-1"}}
+{"serialNumber":"VCU-001","firmwareVersion":"1.2.0","metadata":{"location":"6.5244,3.3792","time":"14:30:45","date":"2024:03:15","batteryPercentage":80,"isp":"MTN","signalStrength":"25_LTE"}}
 ```
 
 **Example for Acknowledge:**
 ```json
-{"serialNumber":"VCU-001","taskId":"550e8400-e29b-41d4-a716-446655440000"}
+{"serialNumber":"VCU-001","taskId":"550e8400e29b41d4a716446655440000","initiatingOta":true,"batteryPercentage":80,"isp":"MTN","rssi":25}
 ```
 
 **Example for Update Complete:**
 ```json
-{"serialNumber":"VCU-001","taskId":"550e8400-e29b-41d4-a716-446655440000","newVersion":"2.0.0","success":true}
+{"serialNumber":"VCU-001","taskId":"550e8400e29b41d4a716446655440000","newVersion":"2.0.0","success":true}
 ```
 
 #### Step 3: Generate RSA Signature
@@ -497,7 +685,7 @@ void send_call_home() {
         "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC...\n"
         "-----END PRIVATE KEY-----\n";
     
-    const char* payload = "{\"serialNumber\":\"VCU-001\",\"deviceVersion\":\"1.2.0\"}";
+    const char* payload = "{\"serialNumber\":\"VCU-001\",\"firmwareVersion\":\"1.2.0\",\"metadata\":{\"location\":\"6.5244,3.3792\",\"time\":\"14:30:45\",\"date\":\"2024:03:15\",\"batteryPercentage\":80,\"isp\":\"MTN\",\"signalStrength\":\"25_LTE\"}}";
     char signature[512];
     
     if (generate_rsa_signature(payload, private_key_pem, signature) == 0) {
@@ -543,8 +731,15 @@ MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC...
 
 payload = json.dumps({
     "serialNumber": "VCU-001",
-    "deviceVersion": "1.2.0",
-    "metadata": {"location": "warehouse-1"}
+    "firmwareVersion": "1.2.0",
+    "metadata": {
+        "location": "6.5244,3.3792",
+        "time": "14:30:45",
+        "date": "2024:03:15",
+        "batteryPercentage": 80,
+        "isp": "MTN",
+        "signalStrength": "25_LTE"
+    }
 }, separators=(',', ':'))  # Compact JSON - no spaces
 
 signature = generate_rsa_signature(payload, private_key_pem)
@@ -555,7 +750,7 @@ print(f"Signature: {signature}")
 
 ```bash
 PRIVATE_KEY_FILE="private_key.pem"
-PAYLOAD='{"serialNumber":"VCU-001","deviceVersion":"1.2.0"}'
+PAYLOAD='{"serialNumber":"VCU-001","firmwareVersion":"1.2.0","metadata":{"location":"6.5244,3.3792","time":"14:30:45","date":"2024:03:15","batteryPercentage":80,"isp":"MTN","signalStrength":"25_LTE"}}'
 
 # Generate RSA signature
 SIGNATURE=$(echo -n "$PAYLOAD" | \
@@ -569,11 +764,11 @@ curl -X POST "https://api.example.com/v1/device-api/call-home" \
   -d "$PAYLOAD"
 ```
 
-#### Step 4: Send the Request
+#### Step 4: Send the Request (Both Methods)
 
 Send an HTTP POST request with:
 - **Content-Type**: `application/json`
-- **X-RECHAJ-SIGNATURE**: The base64-encoded signature
+- **X-RECHAJ-SIGNATURE**: The base64-encoded signature (HMAC or RSA)
 - **Body**: The exact JSON payload you signed
 
 **Example HTTP Request:**
@@ -582,9 +777,9 @@ POST /v1/device-api/call-home HTTP/1.1
 Host: api.example.com
 Content-Type: application/json
 X-RECHAJ-SIGNATURE: 3xK8mP2vQ9wR5tY7uI1oA6sD4fG8hJ2kL9mN0pQ3rS6tU=
-Content-Length: 65
+Content-Length: 185
 
-{"serialNumber":"VCU-001","deviceVersion":"1.2.0"}
+{"serialNumber":"VCU-001","firmwareVersion":"1.2.0","metadata":{"location":"6.5244,3.3792","time":"14:30:45","date":"2024:03:15","batteryPercentage":80,"isp":"MTN","signalStrength":"25_LTE"}}
 ```
 
 ### Complete Device API Examples
@@ -599,11 +794,14 @@ Content-Length: 65
 ```json
 {
   "serialNumber": "VCU-001",
-  "deviceVersion": "1.2.0",
+  "firmwareVersion": "1.2.0",
   "metadata": {
-    "location": "warehouse-1",
-    "temperature": 25.5,
-    "signalStrength": -65
+    "location": "6.5244,3.3792",
+    "time": "14:30:45",
+    "date": "2024:03:15",
+    "batteryPercentage": 80,
+    "isp": "MTN",
+    "signalStrength": "25_LTE"
   }
 }
 ```
@@ -617,10 +815,12 @@ Content-Length: 65
     "latestVersion": "2.0.0",
     "downloadUrl": "https://s3.amazonaws.com/bucket/firmware/2.0.0.bin",
     "updateType": "FORCE",
-    "taskId": "550e8400-e29b-41d4-a716-446655440000"
+    "taskId": "550e8400e29b41d4a716446655440000"
   }
 }
 ```
+
+**Note**: Task IDs are 32 characters (UUID without hyphens). OTA updates are automatically skipped if battery < 40% or signal strength is poor (RSSI < 10).
 
 **Response (No Update):**
 ```json
@@ -634,13 +834,16 @@ Content-Length: 65
 
 **C Implementation Example:**
 ```c
-int call_home(const char* serial_number, const char* device_version, 
+int call_home(const char* serial_number, const char* firmware_version,
+               int battery_percent, const char* isp, int rssi,
+               const char* location, const char* time_str, const char* date_str,
                const char* private_key_pem) {
     // 1. Build JSON payload (compact format)
-    char payload[512];
+    char payload[1024];
     snprintf(payload, sizeof(payload), 
-             "{\"serialNumber\":\"%s\",\"deviceVersion\":\"%s\"}",
-             serial_number, device_version);
+             "{\"serialNumber\":\"%s\",\"firmwareVersion\":\"%s\",\"metadata\":{\"location\":\"%s\",\"time\":\"%s\",\"date\":\"%s\",\"batteryPercentage\":%d,\"isp\":\"%s\",\"signalStrength\":\"%d_LTE\"}}",
+             serial_number, firmware_version, location, time_str, date_str,
+             battery_percent, isp, rssi);
     
     // 2. Generate RSA signature using private key
     char signature[512];
@@ -669,9 +872,15 @@ int call_home(const char* serial_number, const char* device_version,
 ```json
 {
   "serialNumber": "VCU-001",
-  "taskId": "550e8400-e29b-41d4-a716-446655440000"
+  "taskId": "550e8400e29b41d4a716446655440000",
+  "initiatingOta": true,
+  "batteryPercentage": 80,
+  "isp": "MTN",
+  "rssi": 25
 }
 ```
+
+**Note**: The `initiatingOta` field indicates whether the device will proceed with the OTA update. If `false`, the system logs the reason (low battery or poor signal) for analytics.
 
 **Response:**
 ```json
@@ -683,12 +892,14 @@ int call_home(const char* serial_number, const char* device_version,
 
 **C Implementation Example:**
 ```c
-int acknowledge_task(const char* serial_number, const char* task_id, 
-                    const char* private_key_pem) {
-    char payload[256];
+int acknowledge_task(const char* serial_number, const char* task_id,
+                     int initiating_ota, int battery_percent, const char* isp, int rssi,
+                     const char* private_key_pem) {
+    char payload[512];
     snprintf(payload, sizeof(payload),
-             "{\"serialNumber\":\"%s\",\"taskId\":\"%s\"}",
-             serial_number, task_id);
+             "{\"serialNumber\":\"%s\",\"taskId\":\"%s\",\"initiatingOta\":%s,\"batteryPercentage\":%d,\"isp\":\"%s\",\"rssi\":%d}",
+             serial_number, task_id, initiating_ota ? "true" : "false",
+             battery_percent, isp, rssi);
     
     char signature[512];
     generate_rsa_signature(payload, private_key_pem, signature);
@@ -710,7 +921,7 @@ int acknowledge_task(const char* serial_number, const char* task_id,
 ```json
 {
   "serialNumber": "VCU-001",
-  "taskId": "550e8400-e29b-41d4-a716-446655440000",
+  "taskId": "550e8400e29b41d4a716446655440000",
   "newVersion": "2.0.0",
   "success": true
 }
@@ -720,12 +931,14 @@ int acknowledge_task(const char* serial_number, const char* task_id,
 ```json
 {
   "serialNumber": "VCU-001",
-  "taskId": "550e8400-e29b-41d4-a716-446655440000",
+  "taskId": "550e8400e29b41d4a716446655440000",
   "newVersion": "1.2.0",
   "success": false,
   "errorMessage": "Checksum verification failed"
 }
 ```
+
+**Note**: Task IDs must be 32 characters (UUID without hyphens). The system accepts both formats (with and without hyphens) for backward compatibility.
 
 **Response:**
 ```json
@@ -741,6 +954,7 @@ int report_update_complete(const char* serial_number, const char* task_id,
                            const char* new_version, int success,
                            const char* error_message, const char* private_key_pem) {
     char payload[512];
+    // Note: task_id should be 32 characters (UUID without hyphens)
     if (error_message && strlen(error_message) > 0) {
         snprintf(payload, sizeof(payload),
                  "{\"serialNumber\":\"%s\",\"taskId\":\"%s\",\"newVersion\":\"%s\",\"success\":%s,\"errorMessage\":\"%s\"}",
@@ -762,32 +976,6 @@ int report_update_complete(const char* serial_number, const char* task_id,
     return 0;
 }
 ```
-
-### Alternative: HMAC Signing
-
-If your system uses HMAC instead of RSA, you can use a shared secret key. Contact your administrator to confirm which method is configured.
-
-**C Example for HMAC:**
-
-```c
-#include <openssl/hmac.h>
-#include <openssl/sha.h>
-
-int generate_hmac_signature(const char* payload, const char* secret_key, char* signature_out) {
-    unsigned char hmac_result[SHA256_DIGEST_LENGTH];
-    unsigned int hmac_len;
-    
-    HMAC(EVP_sha256(), 
-         secret_key, strlen(secret_key),
-         (unsigned char*)payload, strlen(payload),
-         hmac_result, &hmac_len);
-    
-    base64_encode(hmac_result, SHA256_DIGEST_LENGTH, signature_out);
-    return 0;
-}
-```
-
-**Note**: Check with your system administrator to determine if your system uses RSA (private key) or HMAC (shared secret). The examples above show RSA, which is the standard method.
 
 ### Critical Requirements
 
@@ -813,11 +1001,11 @@ int generate_hmac_signature(const char* payload, const char* secret_key, char* s
 
 **Common Causes:**
 - Missing `X-RECHAJ-SIGNATURE` header
-- Incorrect private key (wrong key or key format issue)
+- Incorrect secret key (for HMAC) or private key (for RSA)
 - Payload mismatch (signed payload doesn't match request body)
 - Incorrect base64 encoding
-- Wrong signature algorithm (must use SHA256withRSA)
-- Private key not matching the public key configured on server
+- Wrong signature algorithm (must use HmacSHA256 for HMAC or SHA256withRSA for RSA)
+- Secret key (HMAC) or private key (RSA) not matching the server configuration
 
 **Debugging Tips:**
 1. Verify the exact payload string matches between signing and sending
@@ -830,9 +1018,10 @@ int generate_hmac_signature(const char* payload, const char* secret_key, char* s
 
 **Step 1: Test with cURL**
 ```bash
-# Use your private key file
+# Use your private key file (for RSA) or secret key (for HMAC)
 PRIVATE_KEY_FILE="private_key.pem"
-PAYLOAD='{"serialNumber":"VCU-001","deviceVersion":"1.2.0"}'
+SECRET_KEY="your-shared-secret-key"  # For HMAC
+PAYLOAD='{"serialNumber":"VCU-001","firmwareVersion":"1.2.0","metadata":{"location":"6.5244,3.3792","time":"14:30:45","date":"2024:03:15","batteryPercentage":80,"isp":"MTN","signalStrength":"25_LTE"}}'
 
 # Generate RSA signature
 SIGNATURE=$(echo -n "$PAYLOAD" | \
@@ -881,12 +1070,14 @@ For questions or issues:
 
 ### Key Points Summary
 
-- ✅ **Use RSA private key** to sign requests (SHA256withRSA algorithm)
-- ✅ **Server verifies** with the corresponding public key
-- ✅ **Keep private key secure** - never share or expose it
+- ✅ **HMAC is preferred** - Use shared secret key (HmacSHA256 algorithm) for better performance
+- ✅ **RSA is supported** - Use private key (SHA256withRSA algorithm) for backward compatibility
+- ✅ **Keep keys secure** - Never share private keys or secret keys, never expose them
 - ✅ **Payload must match exactly** between signing and sending
 - ✅ **Base64 encode** the signature before sending
 - ✅ **Use HTTPS** for all API communication
+- ✅ **Task IDs are 32 characters** (UUID without hyphens) to minimize payload size
+- ✅ **OTA constraints** - Updates are skipped if battery < 40% or signal is poor (RSSI < 10)
 
 ### How It Works
 
@@ -919,202 +1110,6 @@ sequenceDiagram
         Verifier-->>Filter: false
         Filter-->>-Client: 401 Unauthorized
     end
-```
-
-### Integration Guide
-
-#### Step 1: Configure the Server
-
-Add to your `application.yml`:
-
-```yaml
-vms:
-  security:
-    signature:
-      # Use HMAC (simpler) or RSA (more secure)
-      use-hmac: true
-      # For HMAC - shared secret (use environment variable in production)
-      secret-key: ${VMS_SIGNATURE_SECRET_KEY:your-secret-key}
-      # For RSA - base64-encoded public key
-      # public-key: ${VMS_SIGNATURE_PUBLIC_KEY}
-```
-
-#### Step 2: Client Implementation (HMAC)
-
-**Java Example:**
-
-```java
-import javax.crypto.Mac;
-import javax.crypto.spec.SecretKeySpec;
-import java.nio.charset.StandardCharsets;
-import java.util.Base64;
-
-public class SignatureGenerator {
-    private static final String HMAC_ALGORITHM = "HmacSHA256";
-
-    public static String generateSignature(String payload, String secretKey)
-            throws Exception {
-        Mac mac = Mac.getInstance(HMAC_ALGORITHM);
-        SecretKeySpec keySpec = new SecretKeySpec(
-            secretKey.getBytes(StandardCharsets.UTF_8),
-            HMAC_ALGORITHM
-        );
-        mac.init(keySpec);
-
-        byte[] signatureBytes = mac.doFinal(
-            payload.getBytes(StandardCharsets.UTF_8)
-        );
-        return Base64.getEncoder().encodeToString(signatureBytes);
-    }
-}
-
-// Usage
-String jsonPayload = "{\"serialNumber\":\"VCU-001\",\"deviceVersion\":\"1.0.0\"}";
-String signature = SignatureGenerator.generateSignature(jsonPayload, secretKey);
-
-HttpRequest request = HttpRequest.newBuilder()
-    .uri(URI.create("https://api.example.com/v1/device-api/call-home"))
-    .header("Content-Type", "application/json")
-    .header("X-RECHAJ-SIGNATURE", signature)
-    .POST(HttpRequest.BodyPublishers.ofString(jsonPayload))
-    .build();
-```
-
-**Python Example:**
-
-```python
-import hmac
-import hashlib
-import base64
-import json
-import requests
-
-def generate_signature(payload: str, secret_key: str) -> str:
-    signature = hmac.new(
-        secret_key.encode('utf-8'),
-        payload.encode('utf-8'),
-        hashlib.sha256
-    ).digest()
-    return base64.b64encode(signature).decode('utf-8')
-
-# Usage
-payload = json.dumps({
-    "serialNumber": "VCU-001",
-    "deviceVersion": "1.0.0",
-    "metadata": {"location": "warehouse-1"}
-}, separators=(',', ':'))  # Compact JSON
-
-signature = generate_signature(payload, secret_key)
-
-response = requests.post(
-    "https://api.example.com/v1/device-api/call-home",
-    headers={
-        "Content-Type": "application/json",
-        "X-RECHAJ-SIGNATURE": signature
-    },
-    data=payload
-)
-```
-
-**cURL Example:**
-
-```bash
-#!/bin/bash
-SECRET_KEY="your-secret-key"
-PAYLOAD='{"serialNumber":"VCU-001","deviceVersion":"1.0.0"}'
-
-# Generate HMAC-SHA256 signature
-SIGNATURE=$(echo -n "$PAYLOAD" | openssl dgst -sha256 -hmac "$SECRET_KEY" -binary | base64)
-
-curl -X POST "https://api.example.com/v1/device-api/call-home" \
-  -H "Content-Type: application/json" \
-  -H "X-RECHAJ-SIGNATURE: $SIGNATURE" \
-  -d "$PAYLOAD"
-```
-
-#### Step 3: Client Implementation (RSA)
-
-For higher security, use RSA asymmetric signatures:
-
-**Java Example:**
-
-```java
-import java.security.*;
-import java.util.Base64;
-
-public class RsaSignatureGenerator {
-    public static String generateSignature(String payload, PrivateKey privateKey)
-            throws Exception {
-        Signature signature = Signature.getInstance("SHA256withRSA");
-        signature.initSign(privateKey);
-        signature.update(payload.getBytes(StandardCharsets.UTF_8));
-
-        byte[] signatureBytes = signature.sign();
-        return Base64.getEncoder().encodeToString(signatureBytes);
-    }
-}
-```
-
-#### Important Notes
-
-1. **Payload Format**: The signature is computed on the exact JSON string sent in the request body. Ensure consistent JSON serialization (key ordering, whitespace).
-
-2. **Header Name**: Always use `X-RECHAJ-SIGNATURE` (case-insensitive).
-
-3. **Error Response**: Invalid signatures return HTTP 401:
-   ```json
-   {
-     "status": 401,
-     "message": "Invalid signature"
-   }
-   ```
-
-4. **Applying the Annotation**: Add `@VerifySignature` to methods or classes:
-   ```java
-   @PostMapping("/call-home")
-   @VerifySignature
-   public ResponseModel<CallHomeResponse> callHome(@RequestBody CallHomeRequest request) {
-       // Only called if signature is valid
-   }
-   ```
-
-### Call Home Request/Response
-
-**Request:**
-```json
-{
-  "serialNumber": "VCU-001",
-  "deviceVersion": "1.2.0",
-  "metadata": {
-    "location": "warehouse-1",
-    "temperature": 25.5,
-    "signalStrength": -65
-  }
-}
-```
-
-**Response (Update Available):**
-```json
-{
-  "success": true,
-  "data": {
-    "updateAvailable": true,
-    "latestVersion": "2.0.0",
-    "downloadUrl": "https://s3.amazonaws.com/bucket/firmware/2.0.0.bin",
-    "updateType": "FORCE",
-    "taskId": "550e8400-e29b-41d4-a716-446655440000"
-  }
-}
-```
-
-**Response (No Update):**
-```json
-{
-  "success": true,
-  "data": {
-    "updateAvailable": false
-  }
-}
 ```
 
 ## Configuration
