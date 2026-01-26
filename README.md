@@ -189,7 +189,9 @@ sequenceDiagram
 - New devices are automatically registered during call-home
 - **OTA Constraints**: Updates are automatically skipped if:
   - Battery percentage is below 40%
-  - Signal strength is poor (RSSI < 10, parsed from signalStrength field)
+  - Signal strength is poor (RSSI < 14, parsed from signalStrength field)
+    - Signal strength thresholds: 6.5-13.5 = poor, 14-20 = fair, 21-31 = good
+    - OTA will not be initiated if RSSI < 14
 - **Metadata Structure**: Call-home metadata must follow the structured format with validated fields (location, time, date, batteryPercentage, isp, signalStrength)
 
 ### 3. Update Task Flow
@@ -220,7 +222,7 @@ sequenceDiagram
         loop Every 5 minutes
             Job->>Job: Find PENDING task devices
             Job->>+MQTT: Send update commands
-            Note right of MQTT: Topic: vcu/command/{serialNumber}
+            Note right of MQTT: Topic: vcu/sub/{serial}
             MQTT->>-Device: Update notification
             Job->>Job: Mark devices as SENT
         end
@@ -820,7 +822,7 @@ Content-Length: 185
 }
 ```
 
-**Note**: Task IDs are 32 characters (UUID without hyphens). OTA updates are automatically skipped if battery < 40% or signal strength is poor (RSSI < 10).
+**Note**: Task IDs are 32 characters (UUID without hyphens). OTA updates are automatically skipped if battery < 40% or signal strength < 14 (RSSI thresholds: 6.5-13.5 = poor, 14-20 = fair, 21-31 = good).
 
 **Response (No Update):**
 ```json
@@ -977,6 +979,56 @@ int report_update_complete(const char* serial_number, const char* task_id,
 }
 ```
 
+#### 4. MQTT OTA Update Command
+
+**Purpose**: Server-initiated OTA update notification sent via MQTT
+
+**Topic**: `vcu/sub/{serialNumber}`
+
+**Example Topic**: `vcu/sub/VCU-001`
+
+**MQTT Message Properties:**
+- **QoS**: 1 (At least once delivery)
+- **Retained**: false
+
+**Payload:**
+```json
+{
+  "command": "VERSION_UPDATE",
+  "taskId": "550e8400e29b41d4a716446655440000",
+  "versionName": "2.0.0",
+  "downloadUrl": "https://s3.amazonaws.com/bucket/firmware/2.0.0.bin",
+  "updateType": "FORCE",
+  "timestamp": 1704067200000
+}
+```
+
+**Field Descriptions:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `command` | String | Always `"VERSION_UPDATE"` for firmware updates |
+| `taskId` | String | 32-character task ID (UUID without hyphens) |
+| `versionName` | String | Target firmware version (e.g., "2.0.0") |
+| `downloadUrl` | String | S3 presigned URL for firmware download |
+| `updateType` | String | Update type: `"FORCE"`, `"OPTIONAL"`, or `"NORMAL_UPDATE"` |
+| `timestamp` | Number | Unix timestamp in milliseconds when command was sent |
+
+**Note**: 
+- The device should subscribe to `vcu/sub/{serialNumber}` where `{serialNumber}` is the device's serial number
+- After receiving this command, the device should:
+  1. Call the `/v1/device-api/call-home` endpoint to verify the update
+  2. Download the firmware from `downloadUrl` if conditions are met (battery ≥ 40%, signal ≥ 14)
+  3. Send acknowledgment via `/v1/device-api/ack` or MQTT
+  4. Report completion via `/v1/device-api/update-complete` or MQTT
+
+**Other MQTT Commands:**
+
+The system also supports other command types:
+- `CONFIG_UPDATE`: Configuration update command
+- `REBOOT`: Device reboot command
+- `STATUS_REQUEST`: Request device status
+
 ### Critical Requirements
 
 1. **Payload Consistency**: The exact JSON string you sign must match exactly what you send in the request body. Any difference (whitespace, key ordering, etc.) will cause verification to fail.
@@ -1077,7 +1129,7 @@ For questions or issues:
 - ✅ **Base64 encode** the signature before sending
 - ✅ **Use HTTPS** for all API communication
 - ✅ **Task IDs are 32 characters** (UUID without hyphens) to minimize payload size
-- ✅ **OTA constraints** - Updates are skipped if battery < 40% or signal is poor (RSSI < 10)
+- ✅ **OTA constraints** - Updates are skipped if battery < 40% or signal < 14 (RSSI thresholds: 6.5-13.5 = poor, 14-20 = fair, 21-31 = good)
 
 ### How It Works
 
